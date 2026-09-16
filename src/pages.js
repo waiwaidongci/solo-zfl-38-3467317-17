@@ -188,8 +188,9 @@ export function mastsPage() {
       <div class="grid2" style="margin-top:12px">
         <form id="repairForm">
           <h2>④ 修复（冻结后报修）</h2>
-          <div class="row"><div><label>原检测/报修人</label><input name="inspector" required></div><div><label>修复措施</label><input name="actions" placeholder="焊补/换丝/涂护"></div></div>
-          <label>说明</label><input name="note"><button class="gray">提交修复单</button>
+          <div id="repairTrigger" class="meta"></div>
+          <div class="row"><div><label>修复措施</label><input name="actions" placeholder="焊补/换丝/涂护"></div><div><label>&nbsp;</label><input name="note" placeholder="说明（可选）"></div></div>
+          <button class="gray">提交修复单</button>
         </form>
         <form id="recheckForm">
           <h2>⑤ 复核 + 复检（须非原检测人）</h2>
@@ -304,7 +305,12 @@ function mastsScript() {
     }
     function renderRepairs() {
       const pend = (current.repairs||[]).filter(r=>r.status==='待复核');
-      $('#repairSel').innerHTML = pend.map(r=>'<option value="'+esc(r.id)+'">'+esc(r.id)+' · '+esc(r.inspector)+'报修</option>').join('') || '<option value="">无待复核修复单</option>';
+      $('#repairSel').innerHTML = pend.map(r=>'<option value="'+esc(r.id)+'">'+esc(r.id)+' · 触发检测人 '+esc(r.inspector)+'</option>').join('') || '<option value="">无待复核修复单</option>';
+      const t = current.frozenByInspection;
+      $('#repairTrigger').innerHTML = current.frozen && t
+        ? '冻结触发检测：<b>'+esc(t.inspectionId)+'</b> · 操作者 <b>'+esc(t.inspector)+'</b> · '
+          +'复核人不得为同一人（原检测人由服务端绑定，报修时无需填写）'
+        : '未冻结时无需修复；冻结由哪条检测触发，就只能由该检测人之外的人复核。';
     }
     function renderRelease() {
       const released = current.release && !current.release.invalidated;
@@ -341,7 +347,14 @@ function mastsScript() {
 
     async function mutate(path, body, ok) {
       try { const r = await api(path, { method:'POST', body: JSON.stringify({ ...body, expectedVersion: version }) }); version = r.version || version; toast(ok); return r; }
-      catch (e) { toast('提交失败：'+e.message+(e.status===409?'（版本过期，已刷新请重试）':''), true); return null; }
+      catch (e) {
+        const hint = e.status===409 ? '（版本过期或幂等键冲突，已刷新请重试）'
+          : e.status===428 ? '（缺少版本条件，已刷新请重试）'
+          : e.status===403 ? '（复核人必须不是触发冻结的检测人）' : '';
+        toast('提交失败：'+e.message+hint, true);
+        await loadMasts(current && current.id).catch(()=>{});
+        return null;
+      }
     }
 
     $('#regForm').onsubmit = async e => { e.preventDefault();
@@ -364,10 +377,14 @@ function mastsScript() {
       const r = await mutate('/api/masts/'+current.id+'/inspections', body, '检测已提交');
       if (r) { $('#insForm').reset(); await loadMasts(current.id); if (r.grade==='停用') toast('达到停用线，校准与交付已冻结', true); }
     };
+    const idKey = p => p+'-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);
     $('#repairForm').onsubmit = async e => { e.preventDefault();
       if (!current) return;
       const f = new FormData($('#repairForm'));
-      const r = await mutate('/api/masts/'+current.id+'/repairs', { inspector: f.get('inspector'), actions: String(f.get('actions')).split(',').map(s=>s.trim()).filter(Boolean), note: f.get('note') }, '修复单已提交，等待非本人复核');
+      // 不再提交“原检测人”：服务端按触发冻结的实际检测记录绑定
+      const r = await mutate('/api/masts/'+current.id+'/repairs',
+        { actions: String(f.get('actions')).split(',').map(s=>s.trim()).filter(Boolean), note: f.get('note'), idempotencyKey: idKey('rp') },
+        '修复单已提交，等待非本人复核');
       if (r) { $('#repairForm').reset(); await loadMasts(current.id); }
     };
     $('#recheckForm').onsubmit = async e => { e.preventDefault();
@@ -376,6 +393,7 @@ function mastsScript() {
       const repairId = f.get('repairId');
       if (!repairId) return toast('没有待复核的修复单', true);
       const body = Object.fromEntries(f.entries()); delete body.repairId;
+      body.idempotencyKey = idKey('ck');
       const r = await mutate('/api/repairs/'+repairId+'/recheck', body, '复检已提交');
       if (r) { $('#recheckForm').reset(); await loadMasts(current.id); }
     };

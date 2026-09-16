@@ -44,6 +44,11 @@ function recompute(mast) {
       mast.frozen = true;
       mast.freezeReason = ev.blockers.join("；") || "指标达到停用线";
       mast.frozenAt = latest ? latest.at : new Date().toISOString();
+      // 绑定“实际触发冻结的检测记录”。复核身份以服务端记录的操作者为准，
+      // 不信任任何请求里自报的原检测人。
+      mast.frozenByInspection = latest
+        ? { inspectionId: latest.id, inspector: latest.inspector || latest.reviewer || null, point: latest.point || null, at: latest.at }
+        : null;
       mast.logs.push({ at: new Date().toISOString(), step: "冻结", note: mast.freezeReason });
     } else {
       mast.freezeReason = ev.blockers.join("；") || mast.freezeReason;
@@ -82,6 +87,7 @@ export function createMast(input) {
     frozen: false,
     freezeReason: null,
     frozenAt: null,
+    frozenByInspection: null,
     sectionReset: null,
     fatigueReset: null,
     metrics: { loss: 0, fatigue: 0, stress: 0, velocity: 0 },
@@ -137,14 +143,28 @@ export function addInspection(db, mastId, input) {
   return ins;
 }
 
+// 冻结时必须能定位“实际触发冻结的检测记录”；历史数据缺绑定时，回退到冻结时刻
+// 最近一条检测记录（同样由服务端数据决定，绝不采信请求自报）。
+function freezeTrigger(mast) {
+  if (mast.frozenByInspection) return mast.frozenByInspection;
+  const last = mast.inspections.filter(i => !i.superseded).at(-1);
+  return last
+    ? { inspectionId: last.id, inspector: last.inspector || last.reviewer || null, point: last.point || null, at: last.at }
+    : null;
+}
+
 export function createRepair(db, mastId, input) {
   const mast = mustFind(db, mastId);
   if (!mast.frozen) throw new HttpError(423, "mast_not_frozen");
-  const inspector = required(input.inspector, "inspector_required");
+  const trigger = freezeTrigger(mast);
+  if (!trigger || !trigger.inspector) throw new HttpError(409, "freeze_trigger_inspection_missing");
+  // 注意：不读取 input.inspector —— 原检测人以触发冻结的实际检测记录为准
   const repair = {
     id: genId("RP"),
     at: input.at || new Date().toISOString(),
-    inspector,                    // 原检测/报修人
+    inspector: trigger.inspector,                 // 由触发冻结的检测记录带入
+    triggerInspectionId: trigger.inspectionId,
+    triggerPoint: trigger.point,
     note: input.note || "",
     actions: input.actions || [],
     status: "待复核",
@@ -152,16 +172,21 @@ export function createRepair(db, mastId, input) {
     recheck: null,
   };
   mast.repairs.push(repair);
-  mast.logs.push({ at: repair.at, step: "修复单", note: `${inspector} 报修，等待非本人复核` });
+  mast.logs.push({ at: repair.at, step: "修复单", note: `冻结由检测记录 ${trigger.inspectionId}（${trigger.inspector}）触发，等待非本人复核` });
   return repair;
 }
 
-// 复核 + 复检：修复单只能由原检测人以外的人复核；复检不通过不得解除冻结
+// 复核 + 复检：复核人不得是“触发冻结的实际检测记录”的操作者；复检不通过不得解除冻结
 export function recheckRepair(db, repairId, input) {
   const { mast, repair } = findRepair(db, repairId);
   if (repair.status !== "待复核") throw new HttpError(409, "repair_not_pending");
   const reviewer = required(input.reviewer, "reviewer_required");
-  if (reviewer === repair.inspector) throw new HttpError(403, "reviewer_must_be_different");
+  const triggerInspector = repair.inspector; // createRepair 已绑定为实际触发记录的操作者
+  if (reviewer === triggerInspector) {
+    throw new HttpError(403, "reviewer_must_be_different", {
+      triggerInspectionId: repair.triggerInspectionId, triggerInspector,
+    });
+  }
   // 表单可能提交字符串 "false"，不能直接 Boolean()（非空字符串恒为真）
   const passed = input.passed === true || input.passed === "true";
   const recheck = {
@@ -169,7 +194,7 @@ export function recheckRepair(db, repairId, input) {
     kind: "复检",
     at: input.at || new Date().toISOString(),
     reviewer,
-    point: input.point || mast.points[0] || "",
+    point: input.point || repair.triggerPoint || mast.points[0] || "",
     passed,
     crackDepth: num(input.crackDepth),
     crackLength: num(input.crackLength),
@@ -188,7 +213,7 @@ export function recheckRepair(db, repairId, input) {
   mast.inspections.push(recheck);
 
   if (!passed) {
-    // 复检未过：冻结不得解除，阻断原因保持并补充记录
+    // 复检未过：冻结不得解除，阻断原因保持并补充记录；触发记录保持原绑定
     mast.logs.push({ at: recheck.at, step: "复检未过", note: `${reviewer} 复核未通过，维持冻结` });
     recompute(mast);
     recheck.snapshot = { loss: mast.metrics.loss, fatigue: mast.metrics.fatigue, grade: mast.grade };
@@ -210,10 +235,12 @@ export function recheckRepair(db, repairId, input) {
     mast.frozen = false;
     mast.freezeReason = null;
     mast.frozenAt = null;
+    mast.frozenByInspection = null; // 冻结解除，身份绑定随之清除
     mast.logs.push({ at: new Date().toISOString(), step: "解除冻结", note: "停用线指标已消除" });
   } else {
-    // 复检数据显示仍达停用线：继续冻结（freezeReason 已由 recompute 按最新指标更新）
+    // 复检数据仍达停用线：继续冻结，触发记录改绑为本次复检（操作者为复核人）
     mast.frozen = true;
+    mast.frozenByInspection = { inspectionId: recheck.id, inspector: reviewer, point: recheck.point, at: recheck.at };
   }
   return repair;
 }

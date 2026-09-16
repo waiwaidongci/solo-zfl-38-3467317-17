@@ -2,7 +2,7 @@ import http from "node:http";
 import { join } from "node:path";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store, HttpError } from "./src/store.js";
+import { Store, HttpError, bodyFingerprint } from "./src/store.js";
 import {
   registerMast, addInspection, createRepair, recheckRepair,
   releaseMast, assertItemUnblocked,
@@ -70,12 +70,21 @@ function summarize(db, item) {
 }
 
 // 统一事务出口：解析版本/幂等键，捕获冲突与回滚错误
-async function commit(res, req, mutator, { status = 200, replayStatus } = {}) {
+// opts.requireVersion：该写操作必须带版本条件（检测/修复/复检/放行），缺失返 428
+async function commit(res, req, mutator, { status = 200, replayStatus, requireVersion = false, scope } = {}) {
   const input = req._body || {};
   const idempotencyKey = req.headers["idempotency-key"] || input.idempotencyKey || undefined;
+  // 作用域默认精确到“操作 + 资源路径”，跨资源/跨操作的同键重放会被存储层拒绝
+  const scopeKey = scope || `${req.method} ${new URL(req.url, "http://x").pathname}`;
   try {
     const out = await store.mutate(
-      { expectedVersion: input.expectedVersion, idempotencyKey },
+      {
+        expectedVersion: input.expectedVersion,
+        requireVersion,
+        idempotencyKey,
+        scope: scopeKey,
+        fingerprint: bodyFingerprint(input),
+      },
       db => mutator(db, input)
     );
     return send(res, out.replay ? (replayStatus || out.status || status) : (out.status || status),
@@ -183,22 +192,22 @@ const server = http.createServer(async (req, res) => {
         const ins = addInspection(d, mastInspections[1], input);
         const mast = d.masts.find(m => m.id === mastInspections[1] || m.code === mastInspections[1]);
         return { status: 201, body: { inspection: ins, snapshot: ins.snapshot, grade: mast.grade, frozen: mast.frozen, freezeReason: mast.freezeReason, remainingLife: mast.remainingLife } };
-      }, { status: 201 });
+      }, { status: 201, requireVersion: true });
     }
 
     const mastRepairs = url.pathname.match(/^\/api\/masts\/([^/]+)\/repairs$/);
     if (mastRepairs && req.method === "POST") {
-      return commit(res, req, (d, input) => ({ status: 201, body: createRepair(d, mastRepairs[1], input) }), { status: 201 });
+      return commit(res, req, (d, input) => ({ status: 201, body: createRepair(d, mastRepairs[1], input) }), { status: 201, requireVersion: true });
     }
 
     const recheck = url.pathname.match(/^\/api\/repairs\/([^/]+)\/recheck$/);
     if (recheck && req.method === "POST") {
-      return commit(res, req, (d, input) => ({ status: 201, body: recheckRepair(d, recheck[1], input) }), { status: 201 });
+      return commit(res, req, (d, input) => ({ status: 201, body: recheckRepair(d, recheck[1], input) }), { status: 201, requireVersion: true });
     }
 
     const release = url.pathname.match(/^\/api\/masts\/([^/]+)\/release$/);
     if (release && req.method === "POST") {
-      return commit(res, req, (d, input) => ({ body: releaseMast(d, release[1], input) }));
+      return commit(res, req, (d, input) => ({ body: releaseMast(d, release[1], input) }), { requireVersion: true });
     }
 
     send(res, 404, { error: "not_found" });

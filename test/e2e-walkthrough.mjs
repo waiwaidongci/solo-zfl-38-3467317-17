@@ -107,20 +107,46 @@ try {
   check("状态未被改成已交付（仍为校准中）", statusPill.includes("校准中"));
   await shot("05-legacy-delivery-blocked");
 
-  // ---------- 修复：本人复核被拒 ----------
+  // ---------- 修复：本人复核被拒（身份以触发冻结的实际检测记录为准） ----------
   await page.goto(base + "/masts");
   await page.click('.mastline:has-text("E2E-MAST")');
-  await page.fill('#repairForm [name=inspector]', "甲");
+  await sleep(200);
+  // 页面上直接显示服务端绑定的触发检测操作者，表单已无“原检测人”字段
+  check("修复区显示服务端绑定的触发检测人甲",
+    await page.locator('#repairTrigger').innerText().then(t => t.includes("甲") && t.includes("操作者")));
   await page.fill('#repairForm [name=actions]', "焊补裂纹,更换腐段");
   await page.click('#repairForm button');
-  await sleep(250);
+  await sleep(300);
+
+  // 即使请求体伪造“原检测人=别人”，修复单仍必须绑定实际触发记录的操作者甲
+  const forged = await page.evaluate(async () => {
+    let s = await fetch('/api/masts').then(r => r.json());
+    const m = s.masts.find(x => x.code === "E2E-MAST");
+    const r = await fetch('/api/masts/' + m.id + '/repairs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inspector: "冒充者", actions: ["伪造"], expectedVersion: s.version }),
+    }).then(x => x.json());
+    // 立即由乙复检关闭该单（未过，维持冻结），避免遗留待复核单阻断后续放行
+    s = await fetch('/api/masts').then(r => r.json());
+    const close = await fetch('/api/repairs/' + r.id + '/recheck', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewer: "乙", passed: "false", crackDepth: 7, crackLength: 40, expectedVersion: s.version }),
+    }).then(x => x.status);
+    const s2 = await fetch('/api/masts').then(r => r.json());
+    version = s2.version; // 同步页面版本号，供后续 UI 表单提交
+    return { inspector: r.inspector, trigger: r.triggerInspectionId, closeStatus: close };
+  }, );
+  check("修复单忽略请求自报原检测人，绑定触发冻结的实际检测记录",
+    forged.inspector === "甲" && !!forged.trigger && forged.closeStatus === 201);
+  await page.click('.mastline:has-text("E2E-MAST")'); await sleep(200);
+
   await page.selectOption('#repairSel', { index: 0 });
   await page.fill('#recheckForm [name=reviewer]', "甲");
   await page.selectOption('#recheckForm [name=passed]', "true");
   alerts.length = 0;
   await page.click('#recheckForm button');
-  await sleep(300);
-  check("原检测人复核被拒绝（toast 403）", await page.locator('#toast').innerText().then(t => t.includes("reviewer_must_be_different")));
+  await sleep(400);
+  check("触发记录本人复核被拒绝（toast 403）", await page.locator('#toast').innerText().then(t => t.includes("reviewer_must_be_different")));
 
   // ---------- 他人复核但复检未过：维持冻结 ----------
   await page.fill('#recheckForm [name=reviewer]', "乙");
@@ -149,7 +175,51 @@ try {
     version = after.version; // 同步页面内版本号，避免后续表单提交版本过期
     return { codes, count: mast.inspections.filter(i => i.note === "" && i.point === "桅顶").length };
   });
-  check("并发同键：一次201一次重放，且只落一条", oneInserted.count === 1);
+  check("并发同键：一次201一次重放，且只落一条", oneInserted.codes.includes(201) && oneInserted.count === 1);
+
+  // ---------- 无版本并发：两条都必须 428 ----------
+  const noVersion = await page.evaluate(async () => {
+    const m = (await fetch('/api/masts').then(r => r.json())).masts.find(x => x.code === "E2E-MAST");
+    const body = { inspector: "甲", point: "桅顶", corrosionDepth: 1, corrosionWidth: 5, velocity: 3000, load: 5, cycles: 1 };
+    const rs = await Promise.all([
+      fetch('/api/masts/' + m.id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+      fetch('/api/masts/' + m.id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    ]);
+    const codes = await Promise.all(rs.map(async r => ({ s: r.status, e: (await r.json()).error })));
+    return codes;
+  });
+  check("无版本并发检测全部 428 拒绝", noVersion.every(c => c.s === 428 && c.e === "version_required"));
+
+  // ---------- 幂等键跨资源复用：必须 409，不能回放旧响应 ----------
+  const keyScope = await page.evaluate(async () => {
+    const s = await fetch('/api/masts').then(r => r.json());
+    // 用 E2E-MAST 先占用键
+    const m = s.masts.find(x => x.code === "E2E-MAST");
+    const first = await fetch('/api/masts/' + m.id + '/repairs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actions: ["占键"], expectedVersion: s.version, idempotencyKey: "scope-key-x" }),
+    }).then(r => r.json());
+    // 用乙复检关闭该单（未过，维持冻结），避免遗留待复核单阻断后续放行
+    const sa = await fetch('/api/masts').then(r => r.json());
+    await fetch('/api/repairs/' + first.id + '/recheck', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewer: "乙", passed: "false", crackDepth: 7, crackLength: 40, expectedVersion: sa.version }),
+    });
+    // 登记另一根桅杆后复用同一把键
+    const reg = await fetch('/api/masts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: "E2E-OTHER", material: "杉木", section: "圆管", allowableStress: 80, dims: { outerD: 100, innerD: 80 }, points: ["根部"] }),
+    }).then(r => r.json());
+    const s2 = await fetch('/api/masts').then(r => r.json());
+    const conflict = await fetch('/api/masts/' + reg.id + '/repairs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actions: ["跨资源"], expectedVersion: s2.version, idempotencyKey: "scope-key-x" }),
+    }).then(async r => ({ s: r.status, e: (await r.json()).error }));
+    const s3 = await fetch('/api/masts').then(r => r.json());
+    version = s3.version; // 同步页面版本变量，供后续 UI 表单提交
+    return conflict;
+  });
+  check("同键跨资源/跨操作复用返回 409 且不回放", keyScope.s === 409 && keyScope.e === "idempotency_key_reuse_conflict");
 
   // ---------- 回滚：写盘失败时损伤/冻结整体回滚 ----------
   const before = await (await fetch(base + "/api/masts")).json();
@@ -172,10 +242,14 @@ try {
     rollback.nAfter === rollback.nBefore && rollback.frozenAfter === rollback.frozenBefore && rollback.vAfter === rollback.vBefore);
 
   // ---------- 新修复单 + 异人复检通过：解除冻结 ----------
-  await page.fill('#repairForm [name=inspector]', "甲");
+  // 前序裸 fetch 可能推进版本，先刷新页面数据
+  await page.evaluate(() => location.reload());
+  await page.waitForSelector('.mastline:has-text("E2E-MAST")');
+  await page.click('.mastline:has-text("E2E-MAST")');
+  await sleep(300);
   await page.fill('#repairForm [name=actions]', "整段更换");
   await page.click('#repairForm button');
-  await sleep(250);
+  await sleep(300);
   // 选最新待复核单（下拉第二个）
   const opts = await page.locator('#repairSel option').count();
   await page.selectOption('#repairSel', { index: opts - 1 });
