@@ -71,7 +71,7 @@ function summarize(db, item) {
 
 // 统一事务出口：解析版本/幂等键，捕获冲突与回滚错误
 // opts.requireVersion：该写操作必须带版本条件（检测/修复/复检/放行），缺失返 428
-async function commit(res, req, mutator, { status = 200, replayStatus, requireVersion = false, scope } = {}) {
+async function commit(res, req, mutator, { status = 200, requireVersion = false, scope } = {}) {
   const input = req._body || {};
   const idempotencyKey = req.headers["idempotency-key"] || input.idempotencyKey || undefined;
   // 作用域默认精确到“操作 + 资源路径”，跨资源/跨操作的同键重放会被存储层拒绝
@@ -87,8 +87,10 @@ async function commit(res, req, mutator, { status = 200, replayStatus, requireVe
       },
       db => mutator(db, input)
     );
-    return send(res, out.replay ? (replayStatus || out.status || status) : (out.status || status),
-      out.body, out.version != null ? { "X-Version": String(out.version) } : {});
+    // 重放时响应体不变，但 X-Version 返回当前已提交版本（见 store.mutate）
+    const headers = { "X-Version": String(out.version) };
+    if (out.replay) headers["X-Idempotent-Replay"] = "true";
+    return send(res, out.status || status, out.body, headers);
   } catch (err) {
     return handleError(res, err);
   }

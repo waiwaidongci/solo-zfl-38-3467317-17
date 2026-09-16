@@ -90,7 +90,9 @@ export class Store {
               savedScope: saved.scope, requestScope: scope,
             });
           }
-          return { replay: true, ...saved };
+          // 响应体/状态回放首次结果（绝不重复落盘），但版本号必须反映当前已提交状态，
+          // 不能把客户端回拨到首次提交时的版本、导致后续写操作被误判为版本过期。
+          return { replay: true, status: saved.status, body: saved.body, version: db.version };
         }
       }
       if (expectedVersion != null) {

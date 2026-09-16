@@ -95,7 +95,6 @@ export function createMast(input) {
     inspections: [],
     repairs: [],
     release: null,
-    version: 0, // 每次写后同步为 db.version，便于前端乐观并发
     logs: [{ at: new Date().toISOString(), step: "登记", note: `${material} · ${section} · 许用${allowableStress}MPa` }],
   };
 }

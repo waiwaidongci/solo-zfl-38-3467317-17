@@ -241,6 +241,65 @@ try {
   check("回滚：检测未落、冻结状态不变、版本不前进",
     rollback.nAfter === rollback.nBefore && rollback.frozenAfter === rollback.frozenBefore && rollback.vAfter === rollback.vBefore);
 
+  // ---------- 幂等重放版本不滞后（真实浏览器路径） ----------
+  const replayBlock = await page.evaluate(async () => {
+    let s = await fetch('/api/masts').then(r => r.json());
+    // 登记一根专用桅杆并提交一条带幂等键的温和检测
+    const reg = await fetch('/api/masts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: "E2E-REPLAY", material: "杉木", section: "圆管", allowableStress: 80, dims: { outerD: 100, innerD: 80 }, baselineVelocity: 3200, points: ["根部", "桅顶"] }),
+    }).then(r => r.json());
+    const id = reg.id;
+    const payload = { inspector: "甲", point: "根部", crackDepth: 1, crackLength: 5, corrosionDepth: 0, corrosionWidth: 0, velocity: 3200, load: 5, cycles: 10, expectedVersion: (await fetch('/api/masts').then(r => r.json())).version, idempotencyKey: "ui-replay-key" };
+    const first = await fetch('/api/masts/' + id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const firstVersion = Number(first.headers.get('x-version'));
+    const firstId = (await first.json()).inspection.id;
+
+    // 穿插另一次写入推进版本
+    s = await fetch('/api/masts').then(r => r.json());
+    await fetch('/api/masts/' + id + '/inspections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inspector: "甲", point: "桅顶", crackDepth: 1, crackLength: 5, velocity: 3200, load: 5, cycles: 10, expectedVersion: s.version }),
+    });
+    const currentVersion = (await fetch('/api/masts').then(r => r.json())).version;
+
+    // 原样重放（仍带首次的旧 expectedVersion）：必须命中、回放同一记录、返回当前版本
+    const replay = await fetch('/api/masts/' + id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const replayJson = await replay.json();
+    const afterCount = (await fetch('/api/masts').then(r => r.json())).masts.find(x => x.id === id).inspections.length;
+    return {
+      firstId, firstVersion, currentVersion,
+      replayStatus: replay.status,
+      replayFlag: replay.headers.get('x-idempotent-replay'),
+      replayVersion: Number(replay.headers.get('x-version')),
+      replayId: replayJson.inspection && replayJson.inspection.id,
+      afterCount,
+      // 把“重放返回的当前版本”交回页面环境，供后续 UI 表单提交
+      clientVersion: Number(replay.headers.get('x-version')),
+      mastId: id,
+    };
+  });
+  // 将重放返回的版本同步到页面内全局 version 变量（模拟客户端采用响应版本）
+  check("重放命中并回放同一记录", replayBlock.replayStatus === 201 && replayBlock.replayFlag === "true" && replayBlock.replayId === replayBlock.firstId);
+  check("重放只落一条（首发+穿插=2，重放不多落）", replayBlock.afterCount === 2);
+  check("重放返回当前版本而非首次旧版本", replayBlock.replayVersion === replayBlock.currentVersion && replayBlock.replayVersion > replayBlock.firstVersion);
+
+  // 采用重放返回的版本后，经 UI 表单继续提交检测不被 409 挡回
+  await page.reload();
+  await page.waitForSelector('.mastline:has-text("E2E-REPLAY")');
+  await page.click('.mastline:has-text("E2E-REPLAY")');
+  await sleep(200);
+  await fillIns({ inspector: "甲", point: "桅顶", crackDepth: 1, crackLength: 6, corrosionDepth: 0, corrosionWidth: 0, brokenWires: 0, velocity: 3198, load: 5, cycles: 12 });
+  const uiToast = await page.locator('#toast').innerText();
+  check("重放后 UI 继续提交检测成功（不被过期版本挡回）", uiToast.includes("检测已提交"));
+  const afterUi = (await (await fetch(base + "/api/masts")).json()).masts.find(x => x.code === "E2E-REPLAY");
+  check("UI 检测确实新增一条（共3条）", afterUi.inspections.length === 3);
+  // 该桅杆可正常放行，证明后续放行链路版本连续
+  await page.fill('#approver', "复检官");
+  await page.click('#releaseBtn');
+  await sleep(300);
+  check("重放后放行成功（版本连续）", await page.locator('#releaseBox').innerText().then(t => t.includes("已由 复检官 放行")));
+
   // ---------- 新修复单 + 异人复检通过：解除冻结 ----------
   // 前序裸 fetch 可能推进版本，先刷新页面数据
   await page.evaluate(() => location.reload());
@@ -301,6 +360,32 @@ try {
   check("重启后检测/复检/修复流水仍在", hist2.includes("修复单") && hist2.includes("复检"));
   const rel2 = await page2.locator('#releaseBox').innerText();
   check("重启后放行结论仍在", rel2.includes("船政大臣"));
+
+  // 重启后同键重放仍命中持久化的幂等记录，返回当前版本且不重复落盘
+  const replayAfterRestart = await page2.evaluate(async () => {
+    const s = await fetch('/api/masts').then(r => r.json());
+    const m = s.masts.find(x => x.code === "E2E-REPLAY");
+    const before = m.inspections.length;
+    // 指纹只看请求内容（剔除版本/幂等字段），expectedVersion 给过期值也应命中重放
+    const r = await fetch('/api/masts/' + m.id + '/inspections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inspector: "甲", point: "根部", crackDepth: 1, crackLength: 5, corrosionDepth: 0, corrosionWidth: 0, velocity: 3200, load: 5, cycles: 10, expectedVersion: 1, idempotencyKey: "ui-replay-key" }),
+    });
+    const j = await r.json();
+    const after = (await fetch('/api/masts').then(r => r.json())).masts.find(x => x.code === "E2E-REPLAY");
+    return {
+      status: r.status, replay: r.headers.get('x-idempotent-replay'),
+      xv: Number(r.headers.get('x-version')), current: s.version,
+      count: after.inspections.length, before,
+      grade: j.grade,
+    };
+  });
+  check("重启后同键重放命中且不重复落盘",
+    replayAfterRestart.status === 201 && replayAfterRestart.replay === "true"
+    && replayAfterRestart.count === replayAfterRestart.before
+    && replayAfterRestart.count === 3);
+  check("重启后重放返回当前版本", replayAfterRestart.xv === replayAfterRestart.current);
+
   await shot("09-after-restart-persisted", page2);
   await browser2.close();
 

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/domain.test.js test/api.test.js test/security.test.js",
+    "test": "node --test test/domain.test.js test/api.test.js test/security.test.js test/replay.test.js",
     "test:e2e": "node test/e2e-walkthrough.mjs"
   },
   "devDependencies": {
