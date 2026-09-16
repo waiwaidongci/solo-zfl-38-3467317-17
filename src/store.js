@@ -37,6 +37,12 @@ export function bodyFingerprint(body) {
   return createHash("sha256").update(stable(body || {})).digest("hex").slice(0, 32);
 }
 
+// 响应体快照：业务数据均为可 JSON 化对象；深拷贝隔离后续变更，保证重放返回首次结果。
+function snapshotBody(body) {
+  if (body == null) return null;
+  return JSON.parse(JSON.stringify(body));
+}
+
 export class Store {
   constructor(file, seedFactory) {
     this.file = file;
@@ -90,9 +96,9 @@ export class Store {
               savedScope: saved.scope, requestScope: scope,
             });
           }
-          // 响应体/状态回放首次结果（绝不重复落盘），但版本号必须反映当前已提交状态，
-          // 不能把客户端回拨到首次提交时的版本、导致后续写操作被误判为版本过期。
-          return { replay: true, status: saved.status, body: saved.body, version: db.version };
+          // 响应体/状态回放首次结果的完整快照（绝不重复落盘、绝不带回后续变更），
+          // 但版本号必须反映当前已提交状态，不能把客户端回拨到首次提交时的版本。
+          return { replay: true, status: saved.status, body: snapshotBody(saved.body), version: db.version };
         }
       }
       if (expectedVersion != null) {
@@ -115,9 +121,11 @@ export class Store {
       }
       db.version += 1;
       if (idempotencyKey) {
+        // 对响应体做独立深拷贝快照：业务对象（修复单/检测/放行）之后还会被复检、
+        // 核销、放行失效等流程继续修改；若只存引用，重放会把后来的状态带回历史响应。
         db.idempotency[idempotencyKey] = {
           status: result?.status ?? 200,
-          body: result?.body ?? null,
+          body: snapshotBody(result?.body),
           version: db.version,
           scope: scope ?? null,
           fingerprint: fingerprint ?? null,

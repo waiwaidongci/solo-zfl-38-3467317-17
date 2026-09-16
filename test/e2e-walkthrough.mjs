@@ -343,6 +343,78 @@ try {
   await sleep(300);
   check("重新放行成功", await page.locator('#releaseBox').innerText().then(t => t.includes("放行")));
 
+  // ---------- 重放响应主体不漂移（真实浏览器路径，专用桅杆） ----------
+  const snapshotDrift = await page.evaluate(async () => {
+    const get = async () => (await fetch('/api/masts').then(r => r.json()));
+    const reg = async (code) => (await fetch('/api/masts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, material: "杉木", section: "圆管", allowableStress: 80, dims: { outerD: 100, innerD: 80 }, baselineVelocity: 3200, points: ["根部", "桅顶"] }),
+    }).then(r => r.json())).id;
+    const post = async (p, b) => {
+      const r = await fetch(p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
+      return { status: r.status, replay: r.headers.get('x-idempotent-replay'), xv: Number(r.headers.get('x-version')), json: await r.json() };
+    };
+
+    // —— 修复单：复检通过后重放，主体必须仍是首次“待复核” ——
+    const rpMast = await reg("E2E-SNAP-RP");
+    let s = await get();
+    await post(`/api/masts/${rpMast}/inspections`, { inspector: "甲", point: "根部", crackDepth: 8, crackLength: 40, corrosionDepth: 3, corrosionWidth: 40, velocity: 2700, load: 50, cycles: 1000, expectedVersion: s.version });
+    s = await get();
+    const repairPayload = { actions: ["焊补裂纹"], note: "首次报修", expectedVersion: s.version, idempotencyKey: "snap-rp-key" };
+    const firstRp = await post(`/api/masts/${rpMast}/repairs`, repairPayload);
+    const rpId = firstRp.json.id;
+    s = await get();
+    await post(`/api/repairs/${rpId}/recheck`, { reviewer: "乙", passed: true, velocity: 3200, load: 5, cycles: 0, expectedVersion: s.version });
+    const cur = await get();
+    const replayRp = await post(`/api/masts/${rpMast}/repairs`, repairPayload);
+    const currentRp = cur.masts.find(m => m.id === rpMast).repairs[0];
+
+    // —— 放行：新检测使放行失效后重放，主体必须仍是首次有效放行 ——
+    const relMast = await reg("E2E-SNAP-REL");
+    s = await get();
+    await post(`/api/masts/${relMast}/inspections`, { inspector: "甲", point: "根部", crackDepth: 1, crackLength: 5, velocity: 3198, load: 5, cycles: 10, expectedVersion: s.version });
+    s = await get();
+    const relPayload = { approver: "丁", note: "准予交付", expectedVersion: s.version, idempotencyKey: "snap-rel-key" };
+    const firstRel = await post(`/api/masts/${relMast}/release`, relPayload);
+    s = await get();
+    await post(`/api/masts/${relMast}/inspections`, { inspector: "甲", point: "桅顶", crackDepth: 1, crackLength: 5, velocity: 3197, load: 5, cycles: 10, expectedVersion: s.version });
+    const cur2 = await get();
+    const replayRel = await post(`/api/masts/${relMast}/release`, relPayload);
+    const currentRel = cur2.masts.find(m => m.id === relMast).release;
+
+    return {
+      repair: {
+        replayFlag: replayRp.replay,
+        bodyStatus: replayRp.json.status, bodyReviewer: replayRp.json.reviewer, bodyRecheck: replayRp.json.recheck,
+        currentStatus: currentRp.status, currentReviewer: currentRp.reviewer,
+        versionCurrent: replayRp.xv === cur.version,
+        repairCount: cur.masts.find(m => m.id === rpMast).repairs.length,
+      },
+      release: {
+        replayFlag: replayRel.replay,
+        bodyApprover: replayRel.json.approver, bodyInvalidated: replayRel.json.invalidated, bodyAt: replayRel.json.at,
+        firstAt: firstRel.json.at,
+        currentInvalidated: currentRel.invalidated,
+        versionCurrent: replayRel.xv === cur2.version,
+      },
+    };
+  });
+  check("修复单重放主体为首次待复核快照（无复核人/复检）",
+    snapshotDrift.repair.replayFlag === "true"
+    && snapshotDrift.repair.bodyStatus === "待复核"
+    && snapshotDrift.repair.bodyReviewer === null
+    && snapshotDrift.repair.bodyRecheck === null);
+  check("重放不覆盖当前业务（修复单当前已复检通过）且不重复落盘",
+    snapshotDrift.repair.currentStatus === "复检通过" && snapshotDrift.repair.currentReviewer === "乙"
+    && snapshotDrift.repair.repairCount === 1);
+  check("重放版本号单独反映当前状态", snapshotDrift.repair.versionCurrent);
+  check("放行重放主体为首次有效放行（invalidated=false）",
+    snapshotDrift.release.replayFlag === "true"
+    && snapshotDrift.release.bodyApprover === "丁"
+    && snapshotDrift.release.bodyInvalidated === false
+    && snapshotDrift.release.bodyAt === snapshotDrift.release.firstAt);
+  check("放行重放不覆盖当前失效状态", snapshotDrift.release.currentInvalidated === true && snapshotDrift.release.versionCurrent);
+
   // ---------- 持久化：重启服务后数据仍在 ----------
   await browser.close();
   server.kill();
