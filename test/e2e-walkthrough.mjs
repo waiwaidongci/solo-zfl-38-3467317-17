@@ -1,0 +1,244 @@
+// 真实浏览器走查（Playwright + Chromium）：
+// 正常登记/检测 → 监测线 → 停用线冻结 → 旧入口交付被阻断 →
+// 修复异人复核（本人被拒/复检未过/通过解除）→ 放行一次 → 并发只落一条 →
+// 写失败整体回滚 → 重启后数据仍在。关键节点截图到 test/screenshots。
+import { chromium } from "playwright";
+import { spawn } from "node:child_process";
+import { rmSync, mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const dbFile = join("/tmp", `mast-e2e-${process.pid}.json`);
+const shotDir = join(root, "test", "screenshots");
+const port = 41200 + (process.pid % 5000);
+const base = `http://localhost:${port}`;
+
+function startServer() {
+  return spawn(process.execPath, [join(root, "server.js")], {
+    cwd: root,
+    env: { ...process.env, DB_FILE: dbFile, PORT: String(port), ALLOW_FAULTS: "1" },
+    stdio: "inherit",
+  });
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitUp() {
+  for (let i = 0; i < 50; i++) {
+    try { const r = await fetch(base + "/api/stats"); if (r.ok) return; } catch {}
+    await sleep(100);
+  }
+  throw new Error("server not up");
+}
+function check(name, cond) {
+  if (!cond) { console.error("✗ " + name); process.exitCode = 1; throw new Error("走查断言失败: " + name); }
+  console.log("✓ " + name);
+}
+
+rmSync(dbFile, { force: true });
+mkdirSync(shotDir, { recursive: true });
+let server = startServer();
+await waitUp();
+
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 1360, height: 900 } });
+const alerts = [];
+page.on("dialog", async d => { alerts.push(d.message()); await d.accept(); });
+const shot = async (name, p = page) => { await p.screenshot({ path: join(shotDir, name + ".png"), fullPage: true }); };
+
+try {
+  // ---------- 旧入口仍可用 ----------
+  await page.goto(base + "/");
+  check("旧工作台页面可打开", (await page.title()).includes("古船模型帆索校准"));
+  check("旧入口可跳转到桅杆损伤台", await page.locator('a[href="/masts"]').count() === 1);
+  await shot("01-legacy-workbench");
+
+  // ---------- 桅杆登记 ----------
+  await page.goto(base + "/masts");
+  await page.fill('#regForm [name=code]', "E2E-MAST");
+  await page.fill('#regForm [name=material]', "杉木");
+  await page.fill('#regForm [name=allowableStress]', "80");
+  await page.fill('#regForm [name=outerD]', "100");
+  await page.fill('#regForm [name=innerD]', "80");
+  await page.fill('#regForm [name=baselineVelocity]', "3200");
+  await page.fill('#regForm [name=points]', "根部,中段,桅顶");
+  await page.selectOption('#regForm [name=itemId]', { index: 1 }); // 关联种子模型 MR-001
+  await page.click('#regForm button');
+  await page.waitForSelector('.mastline:has-text("E2E-MAST")');
+  await page.click('.mastline:has-text("E2E-MAST")');
+  check("登记后选中桅杆并显示正常等级", await page.locator('#head').innerText().then(t => t.includes("正常")));
+  await shot("02-mast-registered");
+
+  const fillIns = async (v) => {
+    const f = '#insForm ';
+    await page.fill(f + '[name=inspector]', v.inspector);
+    await page.selectOption(f + '[name=point]', v.point);
+    for (const k of ["crackDepth","crackLength","corrosionDepth","corrosionWidth","brokenWires","velocity","load","cycles"]) {
+      await page.fill(f + `[name=${k}]`, String(v[k] ?? 0));
+    }
+    await page.click('#insForm button');
+    await sleep(250);
+  };
+
+  // ---------- 正常 → 监测 ----------
+  await fillIns({ inspector: "甲", point: "根部", crackDepth: 1, crackLength: 10, corrosionDepth: 4, corrosionWidth: 40, velocity: 3150, load: 10, cycles: 2000 });
+  let head = await page.locator('#head').innerText();
+  check("达到监测线：等级变监测并标记持续跟踪", head.includes("监测") && head.includes("持续跟踪"));
+  check("寿命趋势图已渲染", await page.locator('#charts svg').count() >= 5);
+  await shot("03-monitor-line");
+
+  // ---------- 停用线：立即冻结 ----------
+  await fillIns({ inspector: "甲", point: "中段", crackDepth: 8, crackLength: 40, corrosionDepth: 3, corrosionWidth: 40, velocity: 2700, load: 50, cycles: 50000 });
+  head = await page.locator('#head').innerText();
+  check("达到停用线：等级停用+已冻结", head.includes("停用") && head.includes("已冻结"));
+  check("冻结横幅显示阻断原因", await page.locator('#freeze').innerText().then(t => t.includes("停用线")));
+  check("放行按钮被禁用", await page.locator('#releaseBtn').isDisabled());
+  await shot("04-frozen-stop-line");
+
+  // ---------- 旧工作台：交付与校准被阻断 ----------
+  await page.goto(base + "/");
+  await page.waitForSelector('.card');
+  check("旧工作台卡片出现冻结阻断横幅", await page.locator('.freezebanner').first().innerText().then(t => t.includes("E2E-MAST")));
+  const sel = page.locator('.card select[data-status]').first();
+  alerts.length = 0;
+  await sel.selectOption("已交付");
+  await sleep(300);
+  check("旧入口交付被 423 阻断并弹错", alerts.some(a => a.includes("阻断")));
+  const statusPill = await page.locator('.card .pill').first().innerText();
+  check("状态未被改成已交付（仍为校准中）", statusPill.includes("校准中"));
+  await shot("05-legacy-delivery-blocked");
+
+  // ---------- 修复：本人复核被拒 ----------
+  await page.goto(base + "/masts");
+  await page.click('.mastline:has-text("E2E-MAST")');
+  await page.fill('#repairForm [name=inspector]', "甲");
+  await page.fill('#repairForm [name=actions]', "焊补裂纹,更换腐段");
+  await page.click('#repairForm button');
+  await sleep(250);
+  await page.selectOption('#repairSel', { index: 0 });
+  await page.fill('#recheckForm [name=reviewer]', "甲");
+  await page.selectOption('#recheckForm [name=passed]', "true");
+  alerts.length = 0;
+  await page.click('#recheckForm button');
+  await sleep(300);
+  check("原检测人复核被拒绝（toast 403）", await page.locator('#toast').innerText().then(t => t.includes("reviewer_must_be_different")));
+
+  // ---------- 他人复核但复检未过：维持冻结 ----------
+  await page.fill('#recheckForm [name=reviewer]', "乙");
+  await page.selectOption('#recheckForm [name=passed]', "false");
+  await page.fill('#recheckForm [name=crackDepth]', "7");
+  await page.fill('#recheckForm [name=crackLength]', "40");
+  await page.click('#recheckForm button');
+  await sleep(300);
+  head = await page.locator('#head').innerText();
+  check("复检未过：冻结不得解除", head.includes("已冻结") && (await page.locator('#releaseBox').innerText()).includes("复检未过"));
+  await shot("06-recheck-failed-still-frozen");
+
+  // ---------- 并发：同幂等键并发两条检测只落一条（在仍冻结时也会被记录） ----------
+  const beforeCount = await page.$$eval('#history tr', rows => rows.length);
+  const oneInserted = await page.evaluate(async () => {
+    const ver = await fetch('/api/masts').then(r => r.json());
+    const m = ver.masts.find(x => x.code === "E2E-MAST");
+    const payload = { inspector: "甲", point: "桅顶", corrosionDepth: 1, corrosionWidth: 5, velocity: 3000, load: 5, cycles: 10, expectedVersion: ver.version, idempotencyKey: "e2e-dup" };
+    const rs = await Promise.all([
+      fetch('/api/masts/' + m.id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }),
+      fetch('/api/masts/' + m.id + '/inspections', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }),
+    ]);
+    const codes = rs.map(r => r.status);
+    const after = await fetch('/api/masts').then(r => r.json());
+    const mast = after.masts.find(x => x.code === "E2E-MAST");
+    version = after.version; // 同步页面内版本号，避免后续表单提交版本过期
+    return { codes, count: mast.inspections.filter(i => i.note === "" && i.point === "桅顶").length };
+  });
+  check("并发同键：一次201一次重放，且只落一条", oneInserted.count === 1);
+
+  // ---------- 回滚：写盘失败时损伤/冻结整体回滚 ----------
+  const before = await (await fetch(base + "/api/masts")).json();
+  const mastId = before.masts.find(x => x.code === "E2E-MAST").id;
+  await page.evaluate(() => fetch('/test/fail-next-write', { method: 'POST' }));
+  const rollback = await page.evaluate(async (id) => {
+    const s0 = await fetch('/api/masts').then(r => r.json());
+    const m0 = s0.masts.find(x => x.id === id);
+    const n0 = m0.inspections.length, v0 = s0.version, f0 = m0.frozen;
+    const r = await fetch('/api/masts/' + id + '/inspections', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inspector: "甲", point: "桅顶", crackDepth: 20, crackLength: 40, expectedVersion: s0.version }),
+    });
+    const s1 = await fetch('/api/masts').then(r => r.json());
+    const m1 = s1.masts.find(x => x.id === id);
+    return { submitStatus: r.status, frozenBefore: f0, frozenAfter: m1.frozen, nBefore: n0, nAfter: m1.inspections.length, vBefore: v0, vAfter: s1.version };
+  }, mastId);
+  check("回滚：写失败返回500", rollback.submitStatus === 500);
+  check("回滚：检测未落、冻结状态不变、版本不前进",
+    rollback.nAfter === rollback.nBefore && rollback.frozenAfter === rollback.frozenBefore && rollback.vAfter === rollback.vBefore);
+
+  // ---------- 新修复单 + 异人复检通过：解除冻结 ----------
+  await page.fill('#repairForm [name=inspector]', "甲");
+  await page.fill('#repairForm [name=actions]', "整段更换");
+  await page.click('#repairForm button');
+  await sleep(250);
+  // 选最新待复核单（下拉第二个）
+  const opts = await page.locator('#repairSel option').count();
+  await page.selectOption('#repairSel', { index: opts - 1 });
+  await page.fill('#recheckForm [name=reviewer]', "乙");
+  await page.selectOption('#recheckForm [name=passed]', "true");
+  for (const k of ["crackDepth","crackLength","corrosionDepth","corrosionWidth","brokenWires"]) {
+    await page.fill('#recheckForm [name=' + k + ']', "0");
+  }
+  await page.fill('#recheckForm [name=velocity]', "3180");
+  await page.fill('#recheckForm [name=load]', "10");
+  await page.fill('#recheckForm [name=cycles]', "0");
+  await page.click('#recheckForm button');
+  await sleep(400);
+  head = await page.locator('#head').innerText();
+  check("异人复检通过：冻结解除", !head.includes("已冻结") && head.includes("正常"));
+  await shot("07-recheck-passed-unfrozen");
+
+  // ---------- 放行只能成功一次 ----------
+  await page.fill('#approver', "船政大臣");
+  await page.click('#releaseBtn');
+  await sleep(300);
+  check("放行成功显示已放行", await page.locator('#releaseBox').innerText().then(t => t.includes("已由 船政大臣 放行")));
+  check("放行后按钮消失，无法重复放行", await page.locator('#releaseBtn').count() === 0);
+  await shot("08-released-once");
+
+  // 新检测使旧放行失效，可重新放行
+  await fillIns({ inspector: "丙", point: "桅顶", crackDepth: 1, crackLength: 5, corrosionDepth: 1, corrosionWidth: 5, velocity: 3175, load: 5, cycles: 10 });
+  const rb = await page.locator('#releaseBox').innerText();
+  check("新检测后旧放行失效，要求重新放行", rb.includes("须重新放行") && await page.locator('#releaseBtn').isEnabled());
+  await page.fill('#approver', "船政大臣");
+  await page.click('#releaseBtn');
+  await sleep(300);
+  check("重新放行成功", await page.locator('#releaseBox').innerText().then(t => t.includes("放行")));
+
+  // ---------- 持久化：重启服务后数据仍在 ----------
+  await browser.close();
+  server.kill();
+  await sleep(500);
+  server = startServer();
+  await waitUp();
+  const browser2 = await chromium.launch();
+  const page2 = await browser2.newPage({ viewport: { width: 1360, height: 900 } });
+  await page2.goto(base + "/masts");
+  await page2.waitForSelector('.mastline:has-text("E2E-MAST")');
+  await page2.click('.mastline:has-text("E2E-MAST")');
+  const head2 = await page2.locator('#head').innerText();
+  check("重启后桅杆与等级仍在", head2.includes("E2E-MAST") && head2.includes("正常"));
+  const hist2 = await page2.locator('#history').innerText();
+  check("重启后检测/复检/修复流水仍在", hist2.includes("修复单") && hist2.includes("复检"));
+  const rel2 = await page2.locator('#releaseBox').innerText();
+  check("重启后放行结论仍在", rel2.includes("船政大臣"));
+  await shot("09-after-restart-persisted", page2);
+  await browser2.close();
+
+  console.log("\n浏览器走查全部通过，截图见 test/screenshots/");
+  process.exitCode = 0;
+} catch (err) {
+  console.error(err);
+  try { await page.screenshot({ path: join(shotDir, "FAIL.png"), fullPage: true }); } catch {}
+  process.exitCode = 1;
+} finally {
+  await browser.close().catch(() => {});
+  server.kill();
+  // 显式退出，避免子进程句柄/管道让 node 挂住
+  setTimeout(() => process.exit(process.exitCode || 0), 300).unref();
+}
